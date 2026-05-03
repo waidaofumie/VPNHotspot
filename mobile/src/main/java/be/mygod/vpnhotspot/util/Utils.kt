@@ -1,6 +1,5 @@
 package be.mygod.vpnhotspot.util
 
-import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -15,6 +14,7 @@ import android.net.RouteInfo
 import android.net.http.ConnectionMigrationOptions
 import android.net.http.HttpEngine
 import android.os.Build
+import android.os.Parcelable
 import android.os.RemoteException
 import android.os.ext.SdkExtensions
 import android.text.Spannable
@@ -29,10 +29,12 @@ import androidx.annotation.RequiresExtension
 import androidx.core.i18n.DateTimeFormatter
 import androidx.core.i18n.DateTimeFormatterSkeletonOptions
 import androidx.core.net.toUri
+import androidx.core.os.ParcelCompat
 import androidx.core.view.isVisible
 import androidx.databinding.BindingAdapter
 import androidx.fragment.app.DialogFragment
 import androidx.fragment.app.FragmentManager
+import be.mygod.librootkotlinx.useParcel
 import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.net.MacAddressCompat
 import be.mygod.vpnhotspot.widget.SmartSnackbar
@@ -74,6 +76,19 @@ fun Long.toPluralInt(): Int {
 fun Method.matches(name: String, vararg classes: Class<*>) = this.name == name && parameterCount == classes.size &&
         classes.indices.all { i -> parameters[i].type == classes[i] }
 inline fun <reified T> Method.matches1(name: String) = matches(name, T::class.java)
+
+fun Parcelable?.toByteArray(parcelableFlags: Int = 0) = useParcel { parcel ->
+    parcel.writeParcelable(this, parcelableFlags)
+    parcel.marshall()
+}
+
+fun <T : Parcelable> ByteArray.toParcelable(classLoader: ClassLoader?, clazz: Class<T>) = useParcel { parcel ->
+    parcel.unmarshall(this, 0, size)
+    parcel.setDataPosition(0)
+    ParcelCompat.readParcelable(parcel, classLoader, clazz)
+}
+inline fun <reified T : Parcelable> ByteArray.toParcelable(classLoader: ClassLoader?) =
+    toParcelable(classLoader, T::class.java)
 
 fun Context.ensureReceiverUnregistered(receiver: BroadcastReceiver) {
     try {
@@ -167,11 +182,67 @@ fun <T> Sequence<T>.joinToSpanned(separator: CharSequence = ", ", prefix: CharSe
                                   transform: ((T) -> CharSequence)? = null) =
     joinTo(SpannableStringBuilder(), separator, prefix, postfix, limit, truncated, transform)
 
+private fun ByteArray.u32(index: Int) =
+    (this[index].toInt() shl 24 or
+            ((this[index + 1].toInt() and 0xFF) shl 16) or
+            ((this[index + 2].toInt() and 0xFF) shl 8) or
+            (this[index + 3].toInt() and 0xFF)).toUInt()
+
+val InetAddress.isBogon get() = address.let { bytes ->
+    when (bytes.size) {
+        4 -> when (bytes[0].toInt()) {
+            0, 10, 127 -> true
+            else -> bytes.u32(0).let { address ->
+                when {
+                    (address and 0xFFC00000u) == 0x64400000u -> true
+                    (address and 0xFFFF0000u) == 0xA9FE0000u -> true
+                    (address and 0xFFF00000u) == 0xAC100000u -> true
+                    (address and 0xFFFFFF00u) == 0xC0000000u ->
+                        address != 0xC0000009u && address != 0xC000000Au
+                    (address and 0xFFFFFF00u) == 0xC0000200u -> true
+                    address == 0xC0586302u -> true
+                    (address and 0xFFFF0000u) == 0xC0A80000u -> true
+                    (address and 0xFFFE0000u) == 0xC6120000u -> true
+                    (address and 0xFFFFFF00u) == 0xC6336400u -> true
+                    (address and 0xFFFFFF00u) == 0xCB007100u -> true
+                    (address and 0xE0000000u) == 0xE0000000u -> true
+                    else -> false
+                }
+            }
+        }
+        16 -> {
+            val first = bytes.u32(0)
+            val second = bytes.u32(4)
+            val third = bytes.u32(8)
+            val fourth = bytes.u32(12)
+            when {
+                first == 0u && second == 0u && third == 0u && (fourth == 0u || fourth == 1u) -> true
+                first == 0u && second == 0u && third == 0x0000FFFFu -> true
+                first == 0x0064FF9Bu && (second and 0xFFFF0000u) == 0x00010000u -> true
+                first == 0x01000000u && (second == 0u || second == 1u) -> true
+                (first and 0xFFFFFE00u) == 0x20010000u -> !(
+                        first == 0x20010001u && second == 0u && third == 0u && fourth in 1u..3u ||
+                        first == 0x20010003u ||
+                        first == 0x20010004u && (second and 0xFFFF0000u) == 0x01120000u ||
+                        (first and 0xFFFFFFF0u) == 0x20010020u ||
+                        (first and 0xFFFFFFF0u) == 0x20010030u)
+                first == 0x20010DB8u -> true
+                (first and 0xFFFF0000u) == 0x20020000u -> true
+                (first and 0xFFFFF000u) == 0x3FFF0000u -> true
+                (first and 0xFFFF0000u) == 0x5F000000u -> true
+                (first and 0xFE000000u) == 0xFC000000u -> true
+                (first and 0xFFC00000u) == 0xFE800000u ||
+                        (first and 0xFFC00000u) == 0xFEC00000u -> true
+                (first and 0xFF000000u) == 0xFF000000u -> true
+                else -> false
+            }
+        }
+        else -> false
+    }
+}
+
 fun makeIpSpan(ip: InetAddress) = ip.hostAddress.let {
-    // exclude all bogon IP addresses supported by Android APIs
-    if (!app.hasTouch || ip.isMulticastAddress || ip.isAnyLocalAddress || ip.isLoopbackAddress ||
-            ip.isLinkLocalAddress || ip.isSiteLocalAddress || ip.isMCGlobal || ip.isMCNodeLocal ||
-            ip.isMCLinkLocal || ip.isMCSiteLocal || ip.isMCOrgLocal) it else SpannableString(it).apply {
+    if (!app.hasTouch || ip.isBogon) it else SpannableString(it).apply {
         setSpan(CustomTabsUrlSpan("https://ipinfo.io/$it"), 0, length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
     }
 }
@@ -204,15 +275,6 @@ fun NetworkInterface?.formatAddresses(macOnly: Boolean = false,
         appendLine()
     }
 }.trimEnd()
-
-private val parseNumericAddress by lazy @SuppressLint("SoonBlockedPrivateApi") {
-    InetAddress::class.java.getDeclaredMethod("parseNumericAddress", String::class.java).apply {
-        isAccessible = true
-    }
-}
-fun parseNumericAddress(address: String) = if (Build.VERSION.SDK_INT >= 29) {
-    InetAddresses.parseNumericAddress(address)
-} else parseNumericAddress(null, address) as InetAddress
 
 private val getAllInterfaceNames by lazy { LinkProperties::class.java.getDeclaredMethod("getAllInterfaceNames") }
 @Suppress("UNCHECKED_CAST")
