@@ -13,7 +13,6 @@ import android.net.wifi.ScanResult
 import android.net.wifi.SoftApConfiguration
 import android.net.wifi.WpsInfo
 import android.net.wifi.p2p.WifiP2pConfig
-import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
@@ -43,8 +42,6 @@ import be.mygod.vpnhotspot.net.wifi.WifiSsidCompat
 import be.mygod.vpnhotspot.root.RepeaterCommands
 import be.mygod.vpnhotspot.root.RootManager
 import be.mygod.vpnhotspot.util.Services
-import be.mygod.vpnhotspot.util.StickyEvent0
-import be.mygod.vpnhotspot.util.StickyEvent1
 import be.mygod.vpnhotspot.util.TileServiceDismissHandle
 import be.mygod.vpnhotspot.util.UnblockCentral
 import be.mygod.vpnhotspot.util.broadcastReceiver
@@ -60,6 +57,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -90,16 +89,14 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
 
         var persistentSupported = false
 
-        @get:RequiresApi(29)
-        private val hasP2pValidateName by lazy {
+        val safeModeConfigurable by lazy {
+            if (Build.VERSION.SDK_INT >= 30) return@lazy true
             val array = Build.VERSION.SECURITY_PATCH.split('-', limit = 3)
             val y = array.getOrNull(0)?.toIntOrNull()
             val m = array.getOrNull(1)?.toIntOrNull()
             y == null || y > 2020 || y == 2020 && (m == null || m >= 3)
         }
-        val safeModeConfigurable get() = Build.VERSION.SDK_INT >= 29 && hasP2pValidateName
-        val safeMode get() = Build.VERSION.SDK_INT >= 29 &&
-                (!hasP2pValidateName || app.pref.getBoolean(KEY_SAFE_MODE, true))
+        val safeMode get() = !safeModeConfigurable || app.pref.getBoolean(KEY_SAFE_MODE, true)
 
         var networkName: WifiSsidCompat?
             get() = app.pref.getString(KEY_NETWORK_NAME, null).let { legacy ->
@@ -177,24 +174,18 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
     }
 
     inner class Binder : android.os.Binder() {
-        val service get() = this@RepeaterService
-        val active get() = status == Status.ACTIVE
-        val statusChanged = StickyEvent0()
-        var group: WifiP2pGroup? = null
-            set(value) {
-                field = value
-                groupChanged(value)
-                value?.clientList?.let { timeoutMonitor?.onClientsChanged(it.isEmpty()) }
-            }
-        val groupChanged = StickyEvent1 { group }
+        val active get() = status.value == Status.ACTIVE
+        val status = this@RepeaterService.status.asStateFlow()
+        val group = this@RepeaterService.group.asStateFlow()
+        fun clearGroup() = updateGroup(null)
 
         suspend fun obtainDeviceAddress(): MacAddress? {
-            return if (Build.VERSION.SDK_INT >= 29) p2pManager.requestDeviceAddress(channel ?: return null) ?: try {
+            return p2pManager.requestDeviceAddress(channel ?: return null) ?: try {
                 RootManager.use { it.execute(RepeaterCommands.RequestDeviceAddress()) }
             } catch (e: Exception) {
                 Timber.d(e)
                 null
-            } else lastMac?.let { MacAddress.fromString(it) }
+            }
         }
 
         @SuppressLint("NewApi") // networkId is available since Android 4.2
@@ -212,11 +203,11 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
                         return@filter true  // assuming it was changed due to privacy
                     }
                     // WifiP2pServiceImpl only removes self address
-                    Build.VERSION.SDK_INT >= 29 && address == MacAddressCompat.ANY_ADDRESS || address == ownerAddress
+                    address == MacAddressCompat.ANY_ADDRESS || address == ownerAddress
                 }
                 val main = ownedGroups.minByOrNull { it.networkId }
                 // do not replace current group if it's better
-                if (binder.group?.passphrase == null) binder.group = main
+                if (this@RepeaterService.group.value?.passphrase == null) updateGroup(main)
                 return if (main != null) ownedGroups.filter { it.networkId != main.networkId } else emptyList()
             }
             fun Int?.print(group: WifiP2pGroup) {
@@ -280,14 +271,18 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
 
     private val p2pManager get() = Services.p2p!!
     private var channel: WifiP2pManager.Channel? = null
+    private val status = MutableStateFlow(Status.IDLE)
+    private val group = MutableStateFlow<WifiP2pGroup?>(null)
     private val binder = Binder()
     private var timeoutMonitor: TetherTimeoutMonitor? = null
     private var receiverRegistered = false
     private val receiver = broadcastReceiver { _, intent ->
         when (intent.action) {
-            WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION ->
-                if (intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, 0) ==
-                        WifiP2pManager.WIFI_P2P_STATE_DISABLED) clean()    // ignore P2P enabled
+            WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> when (intent.getIntExtra(
+                WifiP2pManager.EXTRA_WIFI_STATE, 0)) {
+                WifiP2pManager.WIFI_P2P_STATE_DISABLED -> clean()
+                WifiP2pManager.WIFI_P2P_STATE_ENABLED -> if (channel == null) initializeChannel()
+            }
             WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> onP2pConnectionChanged(
                     intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_INFO),
                     intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_GROUP))
@@ -296,11 +291,6 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
             }
         }
     }
-    private val deviceListener = broadcastReceiver { _, intent ->
-        val addr = intent.getParcelableExtra<WifiP2pDevice>(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE)?.deviceAddress
-        if (!addr.isNullOrEmpty()) lastMac = addr
-    }
-    private var lastMac: String? = null
     /**
      * Writes and critical reads to routingManager should be protected with this context.
      */
@@ -312,12 +302,10 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
     private val deinitPending = AtomicBoolean(true)
     private val lifecycleGeneration = AtomicInteger()
 
-    var status = Status.IDLE
-        private set(value) {
-            if (field == value) return
-            field = value
-            binder.statusChanged()
-        }
+    private fun updateGroup(value: WifiP2pGroup?) {
+        group.value = value
+        value?.clientList?.let { timeoutMonitor?.onClientsChanged(it.isEmpty()) }
+    }
 
     private fun formatReason(@StringRes resId: Int, reason: Int) = getString(resId, when (reason) {
         WifiP2pManager.ERROR -> getString(R.string.repeater_failure_reason_error)
@@ -333,9 +321,6 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
     override fun onCreate() {
         super.onCreate()
         initializeChannel()
-        if (Build.VERSION.SDK_INT < 29) {
-            registerReceiver(deviceListener, intentFilter(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION))
-        }
         app.pref.registerOnSharedPreferenceChangeListener(this)
     }
 
@@ -401,19 +386,18 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
         } else SmartSnackbar.make(R.string.repeater_failure_disconnected).show()
     }
 
-    private fun initializeChannel() {
+    private fun initializeChannel(): Boolean {
         channel = null
         deinitPending.set(true)
-        if (status != Status.DESTROYED) try {
+        if (status.value == Status.DESTROYED) return false
+        return try {
             // WifiP2pManager.Channel uses AsyncChannel which is leaky, prevent holding onto the Context
             val ref = WeakReference(this)
             channel = p2pManager.initialize(app, Looper.getMainLooper()) { ref.get()?.initializeChannel() }
+            channel != null
         } catch (e: RuntimeException) {
             Timber.w(e)
-            launch(Dispatchers.Main) {
-                delay(1000)
-                initializeChannel()
-            }
+            false
         }
     }
 
@@ -453,12 +437,12 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
      * startService Step 1
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        BootReceiver.startIfEnabled()
-        if (status != Status.IDLE) return START_NOT_STICKY
+        launch { BootReceiver.startIfEnabled() }
+        if (status.value != Status.IDLE) return START_NOT_STICKY
         val channel = channel ?: return START_NOT_STICKY.also { stopSelf() }
         lifecycleGeneration.incrementAndGet()
-        status = Status.STARTING
-        // bump self to foreground location service (API 29+) to use location later, also to avoid getting killed
+        status.value = Status.STARTING
+        // bump self to foreground location service to use location later, also to avoid getting killed
         showNotification()
         launch {
             val filter = intentFilter(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION,
@@ -549,14 +533,14 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
      */
     private fun onP2pConnectionChanged(info: WifiP2pInfo?, group: WifiP2pGroup?) = launch {
         Timber.d("P2P connection changed: $info\n$group")
-        if (status != Status.STARTING && status != Status.ACTIVE) return@launch
+        if (status.value != Status.STARTING && status.value != Status.ACTIVE) return@launch
         when {
             info?.groupFormed != true || !info.isGroupOwner || group?.isGroupOwner != true -> {
                 if (routingManager != null) cleanLocked()
                 // P2P shutdown, else other groups changing before start, ignore
             }
             routingManager != null -> {
-                binder.group = group
+                updateGroup(group)
                 showNotification(group)
             }
             else -> doStartLocked(group)
@@ -569,7 +553,7 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
         if (isAutoShutdownEnabled) timeoutMonitor = TetherTimeoutMonitor(shutdownTimeoutMillis, coroutineContext) {
             binder.shutdown()
         }
-        binder.group = group
+        updateGroup(group)
         if (persistNextGroup) {
             networkName = WifiSsidCompat.fromUtf8Text(group.networkName)
             passphrase = group.passphrase
@@ -580,7 +564,7 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
         routingManager = manager
         manager.start()
         if (routingManager !== manager) return
-        status = Status.ACTIVE
+        status.value = Status.ACTIVE
         showNotification(group)
         BootReceiver.add<RepeaterService>(Starter())
     }
@@ -588,9 +572,7 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
         dismissIfApplicable()
         SmartSnackbar.make(msg).apply {
             if (showWifiEnable) action(R.string.repeater_p2p_unavailable_enable) {
-                if (Build.VERSION.SDK_INT < 29) @Suppress("DEPRECATION") {
-                    Services.wifi.isWifiEnabled = true
-                } else it.context.startActivity(Intent(Settings.Panel.ACTION_WIFI))
+                it.context.startActivity(Intent(Settings.Panel.ACTION_WIFI))
             }
         }.show()
         if (group != null) removeGroup() else clean()
@@ -619,8 +601,8 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
     }
     private suspend fun cleanLocked(shouldDisable: Boolean = true, generation: Int = lifecycleGeneration.get()) {
         cleanupMutex.withLock {
-            if (status != Status.DESTROYED && generation != lifecycleGeneration.get()) return@withLock
-            if (status != Status.DESTROYED) status = Status.STOPPING
+            if (status.value != Status.DESTROYED && generation != lifecycleGeneration.get()) return@withLock
+            if (status.value != Status.DESTROYED) status.value = Status.STOPPING
             if (shouldDisable) BootReceiver.delete<RepeaterService>()
             if (receiverRegistered) {
                 ensureReceiverUnregistered(receiver)
@@ -632,22 +614,21 @@ class RepeaterService : Service(), CoroutineScope, SharedPreferences.OnSharedPre
             val manager = routingManager
             routingManager = null
             manager?.stop()
-            if (status != Status.DESTROYED && generation != lifecycleGeneration.get()) return@withLock
-            if (status != Status.DESTROYED) status = Status.IDLE
+            if (status.value != Status.DESTROYED && generation != lifecycleGeneration.get()) return@withLock
+            if (status.value != Status.DESTROYED) status.value = Status.IDLE
             ServiceNotification.stopForeground(this)
             stopSelf()
         }
     }
 
     override fun onDestroy() {
-        if (status != Status.IDLE) binder.shutdown()
+        if (status.value != Status.IDLE) binder.shutdown()
         launch {    // force clean to prevent leakage
             cleanLocked(false)
             cancel()
         }
         app.pref.unregisterOnSharedPreferenceChangeListener(this)
-        if (Build.VERSION.SDK_INT < 29) unregisterReceiver(deviceListener)
-        status = Status.DESTROYED
+        status.value = Status.DESTROYED
         channel?.close()
         super.onDestroy()
     }

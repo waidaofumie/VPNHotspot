@@ -3,12 +3,13 @@ plugins {
     alias(libs.plugins.ben.manes.versions)
     alias(libs.plugins.crashlytics) apply false
     alias(libs.plugins.google.services) apply false
-    alias(libs.plugins.kotlin.android) apply false
+    alias(libs.plugins.kotlin.parcelize) apply false
     alias(libs.plugins.ksp) apply false
+    alias(libs.plugins.wire) apply false
 }
 
 buildscript {
     dependencies {
-        classpath("com.google.android.gms:oss-licenses-plugin:0.10.10")
+        classpath("com.google.android.gms:oss-licenses-plugin:0.12.0")
     }
 }

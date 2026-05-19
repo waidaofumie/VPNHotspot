@@ -1,11 +1,8 @@
 # VPN Hotspot
 
-[![CircleCI](https://circleci.com/gh/Mygod/VPNHotspot.svg?style=shield)](https://circleci.com/gh/Mygod/VPNHotspot)
-[![API](https://img.shields.io/badge/API-28%2B-brightgreen.svg?style=flat)](https://android-arsenal.com/api?level=28)
+[![Test](https://github.com/Mygod/VPNHotspot/actions/workflows/test.yml/badge.svg)](https://github.com/Mygod/VPNHotspot/actions/workflows/test.yml)
 [![Releases](https://img.shields.io/github/downloads/Mygod/VPNHotspot/total.svg)](https://github.com/Mygod/VPNHotspot/releases)
-[![Language: Kotlin](https://img.shields.io/github/languages/top/Mygod/VPNHotspot.svg)](https://github.com/Mygod/VPNHotspot/search?l=kotlin)
-[![Codacy Badge](https://app.codacy.com/project/badge/Grade/e70e52b1a58045819b505c09edcae816)](https://www.codacy.com/gh/Mygod/VPNHotspot/dashboard?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=Mygod/VPNHotspot&amp;utm_campaign=Badge_Grade)
-[![License](https://img.shields.io/github/license/Mygod/VPNHotspot.svg)](LICENSE)
+[![Android 10-16.1](https://img.shields.io/badge/Android-10--16.1-3DDC84?logo=android&logoColor=white)](mobile/build.gradle.kts)
 
 [![Get it on Obtainium](https://github.com/ImranR98/Obtainium/raw/main/assets/graphics/badge_obtainium.png)](https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/Mygod/VPNHotspot)
 
@@ -67,7 +64,10 @@ Default settings are picked to suit general use cases and maximize compatibility
 * (Android 12+) Platform-managed IPsec tunnel VPNs such as Pixel VPN and some `VpnManager`/`Ikev2VpnProfile`
   profiles may need a compatibility workaround. VPN Hotspot updates the live IPv4 tunnel forwarding policy in
   place while sharing and relies on Android to recreate the stock policy when that tunnel is rebuilt.
-* IP Masquerade Mode:
+
+### Downstream
+
+* IPv4 Masquerade Mode:
   - None:
     Nothing will be done to remap address/port from downstream.
     I find turning this option off sometimes works better for dummy VPNs like ad-blockers and socksifiers than Simple mode, e.g. Shadowsocks.
@@ -77,33 +77,31 @@ Default settings are picked to suit general use cases and maximize compatibility
     Let your system handle masquerade.
     Android system will do a few extra things to make things like FTP and tethering traffic counter work.
     You should probably not use this if you are trying to hide your tethering activity from your carrier.
-
-### Downstream
-
-* Disable IPv6 tethering: Turning this option on will disable IPv6 for system tethering. Useful for stopping IPv6 leaks
-  as this app currently doesn't handle IPv6 VPN tethering (see [#6](https://github.com/Mygod/VPNHotspot/issues/6)).
+* IPv6 mode:
+  - System:
+    Leave IPv6 handling to the platform/system routing setup.
+  - Block:
+    Prevent IPv6 leaks on downstream interfaces.
+  - NAT:
+    Assigns a deterministic app-owned ULA `/64` to the downstream and proxies downstream IPv6 TCP/UDP plus best-effort ICMPv6 through a shared root daemon. This is not full packet NAT and does not forward arbitrary IPv6 next-header protocols.
+    This mode operates in userspace thus performance might be degraded.
 * Tethering hardware acceleration:
     This is a shortcut to the same setting in system Developer options.
     Turning this option off is probably a must for making VPN tethering over system tethering work,
      but it might also decrease your battery life while tethering is enabled.
-* Enable DHCP workaround:
-    Only used if your device isn't able to get your clients IP addresses with VPN on.
-    This is a global setting, meaning it will only be applied once globally.
 
 ### Misc
 
 * Keep Wi-Fi alive: Acquire Wi-Fi locks when repeater, temporary hotspot or system VPN hotspot is activated.
-   - Choose "System default" (default since Android 10) to save battery life;
-   - (prior to Android 10) Choose "On" (default) if repeater/hotspot turns itself off automatically or stops working after a while;
-   - (prior to Android 10) Choose "High Performance Mode" to minimize packet loss and latency (will consume more power);
-   - (since Android 10) Choose "Disable power save" to decrease packet latency.
+   - Choose "System default" (default) to save battery life;
+   - Choose "Disable power save" to decrease packet latency.
      An example use case is when a voice connection needs to be kept active even after the device screen goes off.
      Using this mode may improve the call quality.
      Requires support from the hardware.
      Deprecated in Android 14 and is automatically replaced with "Low latency mode".
      Deprecation is due to the impact of it on power dissipation.
      The "Low latency mode" provides much of the same desired functionality with less impact on power dissipation.
-   - (since Android 10) Choose "Low latency mode" to optimize for reduced packet latency, and this might result in:
+   - Choose "Low latency mode" to optimize for reduced packet latency, and this might result in:
      1. Reduced battery life.
      2. Reduced throughput.
      3. Reduced frequency of Wi-Fi scanning.
@@ -120,18 +118,6 @@ Default settings are picked to suit general use cases and maximize compatibility
   Attempt to start a temporary hotspot using system Wi-Fi hotspot configuration.
   This feature is most likely only functional on Android 12 or newer.
   Enabling this switch will also prevent other apps from using the [local-only hotspot](https://developer.android.com/guide/topics/connectivity/localonlyhotspot) functionality.
-* Network status monitor mode: This option controls how the app monitors connected devices as well as interface changes
-  (when custom upstream is used).
-  Requires restarting the app to take effects. (best way is to go to app info and force stop)
-   - Netlink monitor: Use Linux netlink mechanism, most battery efficient but may not work with SELinux enforcing mode.
-     Sometimes auto fallbacks to Netlink monitor with root and Poll.
-   - Netlink monitor with root: Same as above but runs netlink as root. This option works well with SELinux enforcing mode
-     but might still be bugged on devices heavily modified by OEM and/or carriers. Sometimes auto fallbacks to Poll.
-   - Poll: (default) Update network information manually every second. Least battery efficient but it should work on most
-     devices. Recommended to switch to other modes if possible.
-   - Poll with root: Same as Poll but polling is done using a root shell.
-
-
 ## Q & A
 
 Search the [issue tracker](https://github.com/Mygod/VPNHotspot/issues) for more.
@@ -168,8 +154,7 @@ Greylisted/blacklisted APIs or internal constants: (some constants are hardcoded
 * (prior to API 30) `Landroid/net/ConnectivityManager;->ACTION_TETHER_STATE_CHANGED:Ljava/lang/String;,max-target-r`
 * (prior to API 30) `Landroid/net/ConnectivityManager;->EXTRA_ERRORED_TETHER:Ljava/lang/String;,max-target-r`
 * (since API 30) `Landroid/net/ConnectivityModuleConnector;->IN_PROCESS_SUFFIX:Ljava/lang/String;`
-* (since API 29) `Landroid/net/INetd$Stub;->asInterface(Landroid/os/IBinder;)Landroid/net/INetd;`
-* (since API 29, prior to API 33) `Landroid/net/INetd;->firewallRemoveUidInterfaceRules([I)V`
+* (since API 31) `Landroid/net/INetd$Stub;->asInterface(Landroid/os/IBinder;)Landroid/net/INetd;`
 * (since API 31) `Landroid/net/INetd;->ipSecUpdateSecurityPolicy(IIILjava/lang/String;Ljava/lang/String;IIII)V`
 * (since API 30) `Landroid/net/IIntResultListener$Stub;-><init>()V,blocked`
 * (since API 30) `Landroid/net/IIntResultListener;->onResult(I)V,blocked`
@@ -178,13 +163,11 @@ Greylisted/blacklisted APIs or internal constants: (some constants are hardcoded
 * (since API 30) `Landroid/net/TetheringManager$ConnectorConsumer;->onConnectorAvailable(Landroid/net/ITetheringConnector;)V,blocked`
 * (since API 30) `Landroid/net/TetheringManager$TetheringEventCallback;->onTetherableInterfaceRegexpsChanged(Landroid/net/TetheringManager$TetheringInterfaceRegexps;)V,blocked`
 * (since API 31) `Landroid/net/TetheringManager$TetheringEventCallback;->onSupportedTetheringTypes(Ljava/util/Set;)V,blocked`
+* (since API 30) `Landroid/net/TetheringManager;->getConnector(Landroid/net/TetheringManager$ConnectorConsumer;)V,blocked`
 * `Landroid/net/TetheringManager;->TETHER_ERROR_*:I,blocked`
 * (since API 30) `Landroid/net/TetheringManager;->TETHERING_VIRTUAL:I,blocked`
 * (since API 31) `Landroid/net/IpSecManager;->DIRECTION_FWD:I,blocked`
 * (since API 31) `Landroid/net/IpSecManager;->INVALID_SECURITY_PARAMETER_INDEX:I,blocked`
-* (since API 33) `Landroid/net/connectivity/android/net/BpfNetMapsConstants;->IIF_MATCH:J,blocked`
-* (since API 33) `Landroid/net/connectivity/android/net/BpfNetMapsConstants;->LOCKDOWN_VPN_MATCH:J,blocked`
-* (since API 33) `Landroid/net/connectivity/android/net/BpfNetMapsConstants;->UID_OWNER_MAP_PATH:Ljava/lang/String;,blocked`
 * (since API 31) `Landroid/net/wifi/SoftApCapability;->getCountryCode()Ljava/lang/String;,blocked`
 * (since API 33) `Landroid/net/wifi/SoftApConfiguration$Builder;->setRandomizedMacAddress(Landroid/net/MacAddress;)Landroid/net/wifi/SoftApConfiguration$Builder;,blocked`
 * (since API 31) `Landroid/net/wifi/SoftApConfiguration;->BAND_TYPES:[I,blocked`
@@ -201,7 +184,7 @@ Greylisted/blacklisted APIs or internal constants: (some constants are hardcoded
 * (prior to API 30) `Landroid/net/wifi/WifiManager$SoftApCallback;->onNumClientsChanged(I)V,greylist-max-o`
 * `Landroid/net/wifi/WifiManager;->cancelLocalOnlyHotspotRequest()V,unsupported`
 * `Landroid/net/wifi/p2p/WifiP2pConfig$Builder;->MAC_ANY_ADDRESS:Landroid/net/MacAddress;,blocked`
-* (since API 29) `Landroid/net/wifi/p2p/WifiP2pConfig$Builder;->mNetworkName:Ljava/lang/String;,blocked`
+* `Landroid/net/wifi/p2p/WifiP2pConfig$Builder;->mNetworkName:Ljava/lang/String;,blocked`
 * (since API 30) `Landroid/net/wifi/p2p/WifiP2pGroup;->interfaceAddress:[B,unsupported`
 * `Landroid/net/wifi/p2p/WifiP2pManager;->startWps(Landroid/net/wifi/p2p/WifiP2pManager$Channel;Landroid/net/wifi/WpsInfo;Landroid/net/wifi/p2p/WifiP2pManager$ActionListener;)V,unsupported`
 * (prior to API 30) `Landroid/provider/Settings$Global;->SOFT_AP_TIMEOUT_ENABLED:Ljava/lang/String;,lo-prio,max-target-o`
@@ -212,14 +195,12 @@ Greylisted/blacklisted APIs or internal constants: (some constants are hardcoded
 * (on API 29) `Lcom/android/internal/R$bool;->config_wifi_p2p_mac_randomization_supported:I,blacklist`
 * (prior to API 30) `Lcom/android/internal/R$integer;->config_wifi_framework_soft_ap_timeout_delay:I,greylist-max-o`
 * `Lcom/android/internal/R$string;->config_ethernet_iface_regex:I,lo-prio,max-target-o`
-* (since API 29) `Lcom/android/server/wifi/p2p/WifiP2pServiceImpl;->ANONYMIZED_DEVICE_ADDRESS:Ljava/lang/String;`
+* `Lcom/android/server/wifi/p2p/WifiP2pServiceImpl;->ANONYMIZED_DEVICE_ADDRESS:Ljava/lang/String;`
 * (since API 30) `Lcom/android/server/SystemServer;->TETHERING_CONNECTOR_CLASS:Ljava/lang/String;`
 * (since API 33) `Ldalvik/system/BaseDexClassLoader;->pathList:Ldalvik/system/DexPathList;,unsupported`
 * (since API 33) `Ldalvik/system/DexPathList;->nativeLibraryDirectories:Ljava/util/List;,unsupported`
 * (prior to API 33) `Ljava/lang/invoke/MethodHandles$Lookup;-><init>(Ljava/lang/Class;I)V,unsupported`
 * (prior to API 33) `Ljava/lang/invoke/MethodHandles$Lookup;->ALL_MODES:I,lo-prio,max-target-o`
-* (prior to API 29) `Ljava/net/InetAddress;->parseNumericAddress(Ljava/lang/String;)Ljava/net/InetAddress;,core-platform-api,max-target-p`
-
 <details>
 <summary>Hidden whitelisted APIs: (same catch as above, however, things in this list are less likely to be broken)</summary>
 
@@ -278,6 +259,7 @@ Greylisted/blacklisted APIs or internal constants: (some constants are hardcoded
 * (since API 30) `Landroid/net/wifi/SoftApConfiguration$Builder;->setAllowedClientList(Ljava/util/List;)Landroid/net/wifi/SoftApConfiguration$Builder;,sdk,system-api,test-api`
 * (since API 30) `Landroid/net/wifi/SoftApConfiguration$Builder;->setAutoShutdownEnabled(Z)Landroid/net/wifi/SoftApConfiguration$Builder;,sdk,system-api,test-api`
 * (on API 30) `Landroid/net/wifi/SoftApConfiguration$Builder;->setBand(I)Landroid/net/wifi/SoftApConfiguration$Builder;,sdk,system-api,test-api`
+* (since API 30) `Landroid/net/wifi/SoftApConfiguration$Builder;->setBandOptimizationEnabled(Z)Landroid/net/wifi/SoftApConfiguration$Builder;`
 * (since API 30) `Landroid/net/wifi/SoftApConfiguration$Builder;->setBlockedClientList(Ljava/util/List;)Landroid/net/wifi/SoftApConfiguration$Builder;,sdk,system-api,test-api`
 * (since API 31) `Landroid/net/wifi/SoftApConfiguration$Builder;->setBridgedModeOpportunisticShutdownEnabled(Z)Landroid/net/wifi/SoftApConfiguration$Builder;,sdk,system-api,test-api`
 * (since API 33) `Landroid/net/wifi/SoftApConfiguration$Builder;->setBridgedModeOpportunisticShutdownTimeoutMillis(J)Landroid/net/wifi/SoftApConfiguration$Builder;,sdk,system-api,test-api`
@@ -319,6 +301,7 @@ Greylisted/blacklisted APIs or internal constants: (some constants are hardcoded
 * (since API 30) `Landroid/net/wifi/SoftApConfiguration;->getShutdownTimeoutMillis()J,sdk,system-api,test-api`
 * (since API 33) `Landroid/net/wifi/SoftApConfiguration;->getVendorElements()Ljava/util/List;,sdk,system-api,test-api`
 * (since API 30) `Landroid/net/wifi/SoftApConfiguration;->isAutoShutdownEnabled()Z,sdk,system-api,test-api`
+* (since API 30) `Landroid/net/wifi/SoftApConfiguration;->isBandOptimizationEnabled()Z`
 * (since API 31) `Landroid/net/wifi/SoftApConfiguration;->isBridgedModeOpportunisticShutdownEnabled()Z,sdk,system-api,test-api`
 * (since API 30) `Landroid/net/wifi/SoftApConfiguration;->isClientControlByUserEnabled()Z,sdk,system-api,test-api`
 * (since API 36) `Landroid/net/wifi/SoftApConfiguration;->isClientIsolationEnabled()Z,sdk,system-api,test-api`
@@ -369,8 +352,6 @@ Greylisted/blacklisted APIs or internal constants: (some constants are hardcoded
 * `Landroid/net/wifi/p2p/WifiP2pManager;->deletePersistentGroup(Landroid/net/wifi/p2p/WifiP2pManager$Channel;ILandroid/net/wifi/p2p/WifiP2pManager$ActionListener;)V,sdk,system-api,test-api`
 * `Landroid/net/wifi/p2p/WifiP2pManager;->requestPersistentGroupInfo(Landroid/net/wifi/p2p/WifiP2pManager$Channel;Landroid/net/wifi/p2p/WifiP2pManager$PersistentGroupInfoListener;)V,sdk,system-api,test-api`
 * `Landroid/net/wifi/p2p/WifiP2pManager;->setWifiP2pChannels(Landroid/net/wifi/p2p/WifiP2pManager$Channel;IILandroid/net/wifi/p2p/WifiP2pManager$ActionListener;)V,sdk,system-api,test-api`
-* (on API 30) `Landroid/os/SystemProperties;->getBoolean(Ljava/lang/String;Z)Z,sdk,system-api,test-api`
-* (since API 29, prior to API 31) `Landroid/os/SystemProperties;->getLong(Ljava/lang/String;J)J,sdk,system-api,test-api`
 * `Landroid/provider/Settings$Global;->TETHER_OFFLOAD_DISABLED:Ljava/lang/String;,sdk,system-api,test-api`
 
 </details>
@@ -390,28 +371,50 @@ Nonexported system resources:
 Other:
 
 * Activity `com.android.settings/.Settings$TetherSettingsActivity` is assumed to be exported.
-* (since API 29) Requires `/apex/com.android.tethering/javalib/service-connectivity.jar`.
-* (since API 30) Relevant tethering APEX classes used here, including `android.net.INetd*` and
-  `android.net.BpfNetMapsConstants`, may be jarjar-relocated under the optional prefixes
+* `IPv6 NAT` mode depends on the iptables `TPROXY` and `NFQUEUE` targets and
+  transparent sockets. ICMPv6 Echo interception uses app-owned queue `30000`
+  and assumes queued downstream packets expose six-byte source hardware-address
+  metadata through `NFQA_HWADDR`.
+* (since API 30) Relevant tethering APEX classes used here, including `android.net.ITetheringConnector`,
+  may be jarjar-relocated under the optional prefixes
+  `android.net.connectivity` or `com.android.connectivity`.
+* (since API 31) Relevant netd APEX classes used here, including `android.net.INetd*`,
+  may be jarjar-relocated under the optional prefixes
   `android.net.connectivity` or `com.android.connectivity`.
 * (since API 30) When runtime `TetheringEventCallback.onLocalOnlyInterfacesChanged` is present, AOSP dispatches
   startup tether-state callbacks from one `executor.execute { ... }` block in `onCallbackStarted`,
   and later tether-state updates from one `executor.execute { ... }` block in
   `onTetherStatesChanged`.
-* (since API 33) `mUidOwnerMap` is located at `/sys/fs/bpf/netd_shared/map_netd_uid_owner_map` and is consistent with AOSP usages.
+* The Rust DNS proxy submits upstream queries through `android_res_nsend`/`android_res_nresult`.
+  To keep daemon tasks nonblocking while still using `android_res_nresult` as the public result
+  reader/closer, it waits for `dnsproxyd` to close the one-shot `resnsend` client socket before
+  reading the result. This assumes `resnsend` writes the complete resolver result before returning
+  and the socket receive buffer can hold that result until the framework socket listener closes the
+  client socket.
+* For `ip rule` priorities, AOSP local-network/tethering priorities are assumed to be 17000/18000
+  on API 29..30 and 20000/21000 on API 31+. VPNHotspot uses the 17500..17900 or 20500..20900
+  gap between them.
+* For route-table numbers, Android interface tables are assumed to start at ifindex + 1000; `IPv6 NAT`
+  TPROXY uses table 900 to stay below that range and away from AOSP fixed tables 97..99 and kernel built-ins.
+* Clean flushes table 900 because that table is reserved by VPNHotspot. `IPv6 NAT` also adds its
+  deterministic ULA /64 route to Android's shared `local_network` table; Clean never flushes that table
+  and only deletes VPNHotspot prefixes reconstructed from current interface names.
+* For packet marks, Android fwmark is assumed to use low bits for netId and routing metadata.
+* `IPv6 NAT` fwmark fallback for TPROXY uses masked high reserved bits `0x10000000/0x10000000`.
+  That fallback is expected on only kernels without effective `FRA_IP_PROTO` policy-rule support, which upstream Linux added in 4.17.
+* Daemon reply sockets use the AOSP local-network protected mark `0x00030063`, which assumes
+  `LOCAL_NET_ID = 99` plus the `explicitlySelected` and `protectedFromVpn` fwmark bits.
 
-For `ip rule` priorities, `RULE_PRIORITY_SECURE_VPN` and `RULE_PRIORITY_TETHERING` is assumed to be 12000 (or higher) and 18000 respectively;
-DHCP server like `dnsmasq` is assumed to run and send DHCP packets as root.
+System/root command assumptions:
 
-Undocumented system binaries are all bundled and executable:
+The following Android system binaries are assumed to be bundled and executable:
 
-* `iptables-save`, `ip6tables-save`;
-* `echo`;
-* `/system/bin/ip` (`address link monitor neigh rule unreachable`);
-* `ndc` (`ipfwd nat network`);
-* `iptables`, `ip6tables` (with correct version corresponding to API level, `-nvx -L <chain>`);
-* `sh`;
-* `su`.
+* `/system/bin/dumpsys` (`ipsec`);
+* `/system/bin/iptables-restore`, `/system/bin/ip6tables-restore` (`-w --noflush`, restore input
+  commands including `-I`, `-D`, `-N`, `-nvx -L <chain>`);
+* `/system/bin/ndc` (`ipfwd`, `nat`);
+* `/system/bin/settings` (`put global`);
+* `/system/bin/linker`, `/system/bin/linker64` (`path.zip!/program`).
 
 Wi-Fi driver `wpa_supplicant`:
 

@@ -1,295 +1,69 @@
 package be.mygod.vpnhotspot.net
 
-import android.net.LinkProperties
-import android.os.Build
-import android.os.Process
-import android.system.Os
+import android.annotation.SuppressLint
+import android.net.MacAddress
+import android.net.RouteInfo
+import android.provider.Settings
+import androidx.collection.MutableObjectList
+import androidx.collection.MutableScatterMap
+import androidx.collection.MutableScatterSet
+import androidx.collection.ScatterMap
+import androidx.collection.ScatterSet
+import androidx.collection.toScatterSet
 import be.mygod.vpnhotspot.App.Companion.app
-import be.mygod.vpnhotspot.R
-import be.mygod.vpnhotspot.net.dns.DnsForwarder
-import be.mygod.vpnhotspot.net.monitor.FallbackUpstreamMonitor
-import be.mygod.vpnhotspot.net.monitor.IpNeighbourMonitor
 import be.mygod.vpnhotspot.net.monitor.TrafficRecorder
-import be.mygod.vpnhotspot.net.monitor.UpstreamMonitor
-import be.mygod.vpnhotspot.net.monitor.VpnMonitor
+import be.mygod.vpnhotspot.net.monitor.Upstream
+import be.mygod.vpnhotspot.net.monitor.Upstreams
 import be.mygod.vpnhotspot.room.AppDatabase
 import be.mygod.vpnhotspot.root.RootManager
-import be.mygod.vpnhotspot.root.RoutingCommands
-import be.mygod.vpnhotspot.util.RootSession
+import be.mygod.vpnhotspot.root.daemon.ClientConfig
+import be.mygod.vpnhotspot.root.daemon.DaemonController
+import be.mygod.vpnhotspot.root.daemon.Ipv6NatConfig
+import be.mygod.vpnhotspot.root.daemon.Ipv6Prefix
+import be.mygod.vpnhotspot.root.daemon.MasqueradeMode
+import be.mygod.vpnhotspot.root.daemon.SessionConfig
 import be.mygod.vpnhotspot.util.allInterfaceNames
+import be.mygod.vpnhotspot.util.allRoutes
 import be.mygod.vpnhotspot.widget.SmartSnackbar
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okio.ByteString.Companion.toByteString
 import timber.log.Timber
-import java.io.BufferedWriter
 import java.io.IOException
 import java.net.Inet4Address
-import java.net.InetAddress
-import java.net.NetworkInterface
-import java.net.SocketException
+import java.net.Inet6Address
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * A transaction wrapper that helps set up routing environment.
- *
- * Once revert is called, this object no longer serves any purpose.
+ * Builds and updates a root routing session for one downstream interface.
  */
-class Routing(private val caller: Any, private val downstream: String) : IpNeighbourMonitor.Callback {
+class Routing(private val caller: Any, private val downstream: String) {
     companion object {
-        /**
-         * Since Android 5.0, RULE_PRIORITY_TETHERING = 18000.
-         * This also works for Wi-Fi direct where there's no rule at 18000.
-         *
-         * We override system tethering rules by adding our own rules at higher priority.
-         *
-         * Source: https://android.googlesource.com/platform/system/netd/+/b9baf26/server/RouteController.cpp#65
-         */
-        private const val RULE_PRIORITY_UPSTREAM = 17800
-        private const val RULE_PRIORITY_UPSTREAM_FALLBACK = 17900
-        private const val RULE_PRIORITY_UPSTREAM_DISABLE_SYSTEM = 17980
-
-        private const val ROOT_DIR = "/system/bin/"
-        const val IP = "${ROOT_DIR}ip"
-        const val IPTABLES = "iptables -w"
-        const val IP6TABLES = "ip6tables -w"
-
-        fun appendCleanCommands(commands: BufferedWriter) {
-            commands.appendLine("$IPTABLES -t nat -F PREROUTING")
-            commands.appendLine("while $IPTABLES -D FORWARD -j vpnhotspot_fwd; do done")
-            commands.appendLine("$IPTABLES -F vpnhotspot_fwd")
-            commands.appendLine("$IPTABLES -X vpnhotspot_fwd")
-            commands.appendLine("$IPTABLES -F vpnhotspot_acl")
-            commands.appendLine("$IPTABLES -X vpnhotspot_acl")
-            commands.appendLine("while $IPTABLES -t nat -D POSTROUTING -j vpnhotspot_masquerade; do done")
-            commands.appendLine("$IPTABLES -t nat -F vpnhotspot_masquerade")
-            commands.appendLine("$IPTABLES -t nat -X vpnhotspot_masquerade")
-            commands.appendLine("while $IP6TABLES -D INPUT -j vpnhotspot_filter; do done")
-            commands.appendLine("while $IP6TABLES -D FORWARD -j vpnhotspot_filter; do done")
-            commands.appendLine("while $IP6TABLES -D OUTPUT -j vpnhotspot_filter; do done")
-            commands.appendLine("$IP6TABLES -F vpnhotspot_filter")
-            commands.appendLine("$IP6TABLES -X vpnhotspot_filter")
-            commands.appendLine("while $IP rule del priority $RULE_PRIORITY_UPSTREAM; do done")
-            commands.appendLine("while $IP rule del priority $RULE_PRIORITY_UPSTREAM_FALLBACK; do done")
-            commands.appendLine("while $IP rule del priority $RULE_PRIORITY_UPSTREAM_DISABLE_SYSTEM; do done")
-        }
+        private val ipv6NatPrefixSeed: String
+            @SuppressLint("HardwareIds")
+            get() = "${app.packageName}\u0000${
+                Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+            }"
 
         suspend fun clean() {
             TrafficRecorder.clean()
-            RootManager.use { it.execute(RoutingCommands.Clean()) }
-        }
-
-        private suspend fun RootSession.Transaction.iptables(command: String, revert: String) {
-            val result = execQuiet(command, revert)
-            val message = result.message(listOf(command), err = false)
-            if (result.err.isNotEmpty()) Timber.i(message)  // busy wait message
-        }
-        private suspend fun RootSession.Transaction.iptablesAdd(content: String, table: String = "filter") =
-                iptables("$IPTABLES -t $table -A $content", "$IPTABLES -t $table -D $content")
-        private suspend fun RootSession.Transaction.iptablesInsert(content: String, table: String = "filter") =
-                iptables("$IPTABLES -t $table -I $content", "$IPTABLES -t $table -D $content")
-        private suspend fun RootSession.Transaction.ip6tablesInsert(content: String) =
-                iptables("$IP6TABLES -I $content", "$IP6TABLES -D $content")
-
-        private suspend fun RootSession.Transaction.ndc(name: String, command: String, revert: String? = null) {
-            val result = execQuiet(command, revert)
-            val suffix = "200 0 $name operation succeeded\n"
-            result.check(listOf(command), !result.out.endsWith(suffix))
-            if (result.out.length > suffix.length) Timber.i(result.message(listOf(command), true))
-        }
-
-        fun shouldSuppressIpError(e: RoutingCommands.UnexpectedOutputException, isAdd: Boolean = true) =
-                e.result.out.isEmpty() && (e.result.exit == 2 || e.result.exit == 254) && if (isAdd) {
-                    "RTNETLINK answers: File exists"
-                } else {
-                    "RTNETLINK answers: No such file or directory"
-                } == e.result.err.trim()
-    }
-
-    private suspend fun RootSession.Transaction.ipRule(action: String, priority: Int, rule: String = "") {
-        try {
-            exec("$IP rule add $rule iif $downstream $action priority $priority",
-                    "$IP rule del $rule iif $downstream $action priority $priority")
-        } catch (e: RoutingCommands.UnexpectedOutputException) {
-            if (!shouldSuppressIpError(e)) throw e
+            DaemonController.cleanRouting(ipv6NatPrefixSeed)
         }
     }
-    private suspend fun RootSession.Transaction.ipRuleLookup(ifindex: Int, priority: Int, rule: String = "") =
-            // https://android.googlesource.com/platform/system/netd/+/android-5.0.0_r1/server/RouteController.h#37
-            ipRule("lookup ${1000 + ifindex}", priority, rule)
 
-    enum class MasqueradeMode {
-        None,
-        Simple,
-        /**
-         * Netd does not support multiple tethering upstream below Android 9, which we heavily depend on.
-         *
-         * Source: https://android.googlesource.com/platform/system/netd/+/3b47c793ff7ade843b1d85a9be8461c3b4dc693e
-         */
-        Netd,
-    }
-
-    class InterfaceNotFoundException(cause: Throwable) : SocketException() {
-        init {
-            initCause(cause)
-        }
-        override val message: String get() = app.getString(R.string.exception_interface_not_found)
-    }
-
-    private val hostAddress = try {
-        val iface = NetworkInterface.getByName(downstream) ?: error("iface not found")
-        val addresses = iface.interfaceAddresses!!.filter { it.address is Inet4Address && it.networkPrefixLength <= 32 }
-        if (addresses.size > 1) error("More than one addresses was found: $addresses")
-        addresses.first()
-    } catch (e: Exception) {
-        throw InterfaceNotFoundException(e)
-    }
-    private val hostSubnet = "${hostAddress.address.hostAddress}/${hostAddress.networkPrefixLength}"
-    lateinit var transaction: RootSession.Transaction
-    private val scope = CoroutineScope(SupervisorJob() + CoroutineExceptionHandler { _, t -> Timber.w(t) })
-
-    @Volatile
-    private var stopped = false
-    private var masqueradeMode = MasqueradeMode.None
-
-    private val upstreams = HashSet<String>()
-
-    private sealed class RoutingUpdate {
-        class UpstreamSnapshot(val upstream: Upstream, val properties: LinkProperties?) : RoutingUpdate()
-        class NeighboursSnapshot(val neighbours: Collection<IpNeighbour>) : RoutingUpdate()
-    }
-    private val updateLock = Any()
-    private val neighbourUpdateKey = Any()
-    private val pendingUpdates = LinkedHashMap<Any, RoutingUpdate>()
-    private var pendingBarrier: CompletableDeferred<Unit>? = null
-    private val updateSignal = Channel<Unit>(Channel.CONFLATED)
-    private var updateWorker: Job? = null
-    private fun enqueue(update: RoutingUpdate) {
-        synchronized(updateLock) {
-            if (stopped) return
-            when (update) {
-                is RoutingUpdate.UpstreamSnapshot -> {
-                    pendingUpdates.remove(update.upstream)
-                    pendingUpdates[update.upstream] = update
-                }
-                is RoutingUpdate.NeighboursSnapshot -> {
-                    pendingUpdates.remove(neighbourUpdateKey)
-                    pendingUpdates[neighbourUpdateKey] = update
-                }
-            }
-        }
-        val result = updateSignal.trySend(Unit)
-        if (result.isFailure) result.exceptionOrNull()?.let { if (it !is CancellationException) Timber.w(it) }
-    }
-    private class InterfaceGoneException(upstream: String) : IOException("Interface $upstream not found")
-    private open inner class Upstream(val priority: Int) : UpstreamMonitor.Callback {
-        val subrouting = mutableMapOf<String, RootSession.Transaction>()
-
-        override fun onAvailable(properties: LinkProperties?) {
-            enqueue(RoutingUpdate.UpstreamSnapshot(this, properties))
-        }
-        suspend fun update(properties: LinkProperties?) {
-            val toRemove = subrouting.keys.toMutableSet()
-            for (ifname in properties?.allInterfaceNames ?: emptyList()) {
-                if (toRemove.remove(ifname) || !upstreams.add(ifname)) continue
-                try {
-                    val ifindex = Os.if_nametoindex(ifname).also {
-                        if (it <= 0) throw InterfaceGoneException(ifname)
-                    }
-                    val transaction = RootSession.beginTransaction().safeguard {
-                        ipRuleLookup(ifindex, priority)
-                        when (masqueradeMode) {
-                            MasqueradeMode.None -> { }  // nothing to be done here
-                            // note: specifying -i wouldn't work for POSTROUTING
-                            MasqueradeMode.Simple -> iptablesAdd(
-                                "vpnhotspot_masquerade -s $hostSubnet -o $ifname -j MASQUERADE", "nat")
-                            /**
-                             * 0 means that there are no interface addresses coming after, which is unused anyway.
-                             * Revert is intentionally omitted because netd tracks forwarding state globally by
-                             * interface pair without ownership, so disabling here may tear down system-owned state.
-                             *
-                             * https://android.googlesource.com/platform/frameworks/base/+/android-5.0.0_r1/services/core/java/com/android/server/NetworkManagementService.java#1251
-                             * https://android.googlesource.com/platform/system/netd/+/android-5.0.0_r1/server/CommandListener.cpp#638
-                             * https://android.googlesource.com/platform/system/netd/+/e11b8688b1f99292ade06f89f957c1f7e76ceae9/server/TetherController.cpp#652
-                             * https://android.googlesource.com/platform/system/netd/+/e11b8688b1f99292ade06f89f957c1f7e76ceae9/server/TetherController.h#40
-                             */
-                            MasqueradeMode.Netd -> ndc("Nat", "ndc nat enable $downstream $ifname 0")
-                        }
-                    }
-                    if (Build.VERSION.SDK_INT >= 31) try {
-                        RootManager.use { it.execute(IpSecForwardPolicyCommand(ifname)) }
-                    } catch (e: Exception) {
-                        if (e is CancellationException) {
-                            transaction.revert()
-                            throw e
-                        }
-                        SmartSnackbar.make(e).show()
-                        Timber.w(e)
-                    }
-                    subrouting[ifname] = transaction
-                } catch (e: Exception) {
-                    SmartSnackbar.make(e).show()
-                    if (e !is CancellationException && e !is InterfaceGoneException) Timber.w(e)
-                }
-            }
-            for (ifname in toRemove) {
-                subrouting.remove(ifname)?.revert()
-                check(upstreams.remove(ifname))
-            }
-        }
-    }
-    private val fallbackUpstream = Upstream(RULE_PRIORITY_UPSTREAM_FALLBACK)
-    private val upstream = Upstream(RULE_PRIORITY_UPSTREAM)
-    private val emptyCallback = object : UpstreamMonitor.Callback { }
-
-    private inner class Client(private val ip: Inet4Address, private val transaction: RootSession.Transaction) {
-        suspend fun close() {
-            TrafficRecorder.unregister(ip, downstream)
-            transaction.revert()
-        }
-    }
-    private val clients = mutableMapOf<InetAddress, Client>()
-    override fun onIpNeighbourAvailable(neighbours: Collection<IpNeighbour>) {
-        enqueue(RoutingUpdate.NeighboursSnapshot(neighbours))
-    }
-    private suspend fun updateNeighbours(neighbours: Collection<IpNeighbour>) {
-        val toRemove = HashSet(clients.keys)
-        for (neighbour in neighbours) {
-            if (neighbour.dev != downstream || neighbour.ip !is Inet4Address ||
-                    AppDatabase.instance.clientRecordDao.lookupOrDefault(neighbour.lladdr).blocked) continue
-            toRemove.remove(neighbour.ip)
-            try {
-                if (clients.containsKey(neighbour.ip)) continue
-                val address = neighbour.ip.hostAddress
-                val transaction = RootSession.beginTransaction().safeguard {
-                    iptablesInsert("vpnhotspot_acl -i $downstream -s $address -j ACCEPT")
-                    iptablesInsert("vpnhotspot_acl -o $downstream -d $address -j ACCEPT")
-                }
-                try {
-                    TrafficRecorder.register(neighbour.ip, downstream, neighbour.lladdr)
-                    clients[neighbour.ip] = Client(neighbour.ip, transaction)
-                } catch (e: Exception) {
-                    TrafficRecorder.unregister(neighbour.ip, downstream)
-                    transaction.revert()
-                    throw e
-                }
-            } catch (e: Exception) {
-                Timber.w(e)
-                SmartSnackbar.make(e).show()
-            }
-        }
-        if (toRemove.isNotEmpty()) {
-            TrafficRecorder.update()    // record stats before removing rules to prevent stats losing
-            for (address in toRemove) clients.remove(address)!!.close()
-        }
+    enum class Ipv6Mode {
+        System,
+        Block,
+        Nat,
     }
 
     /**
@@ -302,134 +76,271 @@ class Routing(private val caller: Any, private val downstream: String) : IpNeigh
      * The fallback approach is consistent with legacy system's IP forwarding approach,
      * but may be broken when system tethering shutdown before local-only interfaces.
      */
-    suspend fun ipForward() {
-        try {
-            transaction.ndc("ipfwd", "ndc ipfwd enable vpnhotspot_$downstream",
-                "ndc ipfwd disable vpnhotspot_$downstream")
-            return
-        } catch (e: RoutingCommands.UnexpectedOutputException) {
-            Timber.w(IOException("ndc ipfwd enable failure", e))
+    var ipForward = false
+    var ipv6Mode = Ipv6Mode.System
+    var masqueradeMode: MasqueradeMode = MasqueradeMode.MASQUERADE_MODE_NONE
+
+    private val fallbackUpstream = UpstreamTracker()
+    private val primaryUpstream = UpstreamTracker()
+    private val clients = MutableScatterMap<Inet4Address, MacAddress>()
+    private val allowedMacs = MutableScatterSet<MacAddress>()
+    private val started = AtomicBoolean()
+    private val job = Job()
+
+    private sealed class RoutingUpdate(val key: Any) {
+        class UpstreamSnapshot(val upstream: UpstreamTracker, val value: Upstream?) : RoutingUpdate(upstream)
+        class NeighboursSnapshot(val neighbours: Collection<NetlinkNeighbour>) : RoutingUpdate(NeighboursSnapshot) {
+            private companion object
         }
-        transaction.exec("echo 1 >/proc/sys/net/ipv4/ip_forward")
-    }
-
-    suspend fun disableIpv6() {
-        transaction.execQuiet("$IP6TABLES -N vpnhotspot_filter")
-        transaction.ip6tablesInsert("INPUT -j vpnhotspot_filter")
-        transaction.ip6tablesInsert("FORWARD -j vpnhotspot_filter")
-        transaction.ip6tablesInsert("OUTPUT -j vpnhotspot_filter")
-        transaction.ip6tablesInsert("vpnhotspot_filter -i $downstream -j REJECT")
-        transaction.ip6tablesInsert("vpnhotspot_filter -o $downstream -j REJECT")
-    }
-
-    suspend fun forward() {
-        transaction.execQuiet("$IPTABLES -N vpnhotspot_fwd")
-        transaction.execQuiet("$IPTABLES -N vpnhotspot_acl")
-        transaction.iptablesInsert("FORWARD -j vpnhotspot_fwd")
-        transaction.iptablesInsert("vpnhotspot_fwd -i $downstream -j vpnhotspot_acl")
-        transaction.iptablesInsert("vpnhotspot_fwd -o $downstream -m state --state ESTABLISHED,RELATED -j vpnhotspot_acl")
-        transaction.iptablesAdd("vpnhotspot_fwd -i $downstream ! -o $downstream -j REJECT") // ensure blocking works
-        // the real forwarding filters will be added when clients are connected
-    }
-
-    suspend fun masquerade(mode: MasqueradeMode) {
-        masqueradeMode = mode
-        if (mode == MasqueradeMode.Simple) {
-            transaction.execQuiet("$IPTABLES -t nat -N vpnhotspot_masquerade")
-            transaction.iptablesInsert("POSTROUTING -j vpnhotspot_masquerade", "nat")
-            // further rules are added when upstreams are found
+        class BlockedMacsSnapshot(val macs: ScatterSet<MacAddress>) : RoutingUpdate(BlockedMacsSnapshot) {
+            private companion object
         }
     }
 
-    suspend fun stop() {
-        val done = synchronized(updateLock) {
-            stopped = true
-            if (updateWorker?.isActive == true) {
-                pendingBarrier ?: CompletableDeferred<Unit>().also { pendingBarrier = it }
-            } else null
-        }
-        IpNeighbourMonitor.unregisterCallback(this)
-        DnsForwarder.unregisterClient(this)
-        FallbackUpstreamMonitor.unregisterCallback(fallbackUpstream)
-        UpstreamMonitor.unregisterCallback(upstream)
-        VpnMonitor.unregisterCallback(emptyCallback)
-        if (done != null) {
-            val result = updateSignal.trySend(Unit)
-            if (result.isSuccess) {
-                done.await()
-            } else {
-                result.exceptionOrNull()?.let { if (it !is CancellationException) Timber.w(it) }
-            }
-        }
-        updateSignal.close()
-        scope.cancel("Routing stopped")
-        Timber.i("Stopped routing for $downstream by $caller")
-    }
-
-    /**
-     * Allow protect UDP sockets which will be used by DnsForwarder. Must call this first.
-     */
-    suspend fun allowProtect() {
-        val command = "ndc network protect allow ${Process.myUid()}"
-        val result = transaction.execQuiet(command)
-        val suffix = "200 0 success\n"
-        result.check(listOf(command), !result.out.endsWith(suffix))
-        if (result.out.length > suffix.length) Timber.i(result.message(listOf(command), true))
-    }
-
-    suspend fun commit() {
-        transaction.ipRule("unreachable", RULE_PRIORITY_UPSTREAM_DISABLE_SYSTEM)
-        val useLocalnet = Os.uname().release.split('.', limit = 3).let { version ->
-            val major = version[0].toInt()
-            // https://github.com/torvalds/linux/commit/d0daebc3d622f95db181601cb0c4a0781f74f758
-            major > 3 || major == 3 && version[1].toInt() >= 6
-        }
-        val forwarder = DnsForwarder.registerClient(this, useLocalnet)
-        val hostAddress = hostAddress.address.hostAddress
-        val forwarderIp = if (useLocalnet) {
-            transaction.exec("echo 1 >/proc/sys/net/ipv4/conf/all/route_localnet")
-            "127.0.0.1"
-        } else hostAddress
-        VpnFirewallManager.setup(transaction)
-        transaction.iptablesInsert("PREROUTING -i $downstream -p tcp -d $hostAddress --dport 53 -j DNAT --to-destination $forwarderIp:${forwarder.tcpPort}", "nat")
-        transaction.iptablesInsert("PREROUTING -i $downstream -p udp -d $hostAddress --dport 53 -j DNAT --to-destination $forwarderIp:${forwarder.udpPort}", "nat")
-        transaction.commit()
-        Timber.i("Started routing for $downstream by $caller")
-        check(updateWorker == null)
-        updateWorker = scope.launch {
-            updateSignal.consumeEach {
-                val batch = ArrayList<RoutingUpdate>()
-                val done = synchronized(updateLock) {
-                    batch.addAll(pendingUpdates.values)
-                    pendingUpdates.clear()
-                    pendingBarrier.also { pendingBarrier = null }
+    fun start(): Boolean {
+        if (!started.compareAndSet(false, true)) return false
+        CoroutineScope(job + CoroutineExceptionHandler { _, e ->
+            Timber.w(e)
+            SmartSnackbar.make(e).show()
+        }).launch {
+            var session: DaemonController.SessionCall? = null
+            try {
+                val updates = Channel<RoutingUpdate>(Channel.UNLIMITED)
+                launch {
+                    Upstreams.primary.collect { updates.trySend(RoutingUpdate.UpstreamSnapshot(primaryUpstream, it)) }
                 }
-                for (next in batch) try {
-                    when (next) {
-                        is RoutingUpdate.UpstreamSnapshot -> if (!stopped) next.upstream.update(next.properties)
-                        is RoutingUpdate.NeighboursSnapshot -> if (!stopped) updateNeighbours(next.neighbours)
+                launch {
+                    Upstreams.fallback.collect { updates.trySend(RoutingUpdate.UpstreamSnapshot(fallbackUpstream, it)) }
+                }
+                launch { NetlinkNeighbour.snapshots.collect { updates.trySend(RoutingUpdate.NeighboursSnapshot(it)) } }
+                val initialBlockedMacs = CompletableDeferred<ScatterSet<MacAddress>>()
+                launch {
+                    var first = true
+                    AppDatabase.instance.clientRecordDao.observeBlockedMacs().collect {
+                        val macs = it.toScatterSet()
+                        if (first) {
+                            first = false
+                            initialBlockedMacs.complete(macs)
+                        } else updates.trySend(RoutingUpdate.BlockedMacsSnapshot(macs))
                     }
-                } catch (e: Exception) {
-                    if (e is CancellationException) throw e
-                    Timber.w(e)
                 }
-                done?.complete(Unit)
+                session = DaemonController.startSession(nextConfig())
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    session.events.collect { event ->
+                        event.ipsec_forward_policy?.let {
+                            try {
+                                RootManager.use { server ->
+                                    server.execute(IpSecForwardPolicyCommand(
+                                        uid = it.uid,
+                                        sourceAddress = it.source_address,
+                                        destinationAddress = it.destination_address,
+                                        markValue = it.mark_value,
+                                        xfrmInterfaceId = it.xfrm_interface_id,
+                                    ))
+                                }
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Timber.w(e)
+                                SmartSnackbar.make(e).show()
+                            }
+                        } ?: throw IOException("Unexpected session event $event")
+                    }
+                }
+                var blockedMacs = initialBlockedMacs.await()
+                var neighbours: Collection<NetlinkNeighbour> = emptyList()
+                Timber.i("Started routing for $downstream by $caller")
+                val pendingUpdates = MutableScatterMap<Any, RoutingUpdate>()
+                for (update in updates) {
+                    pendingUpdates[update.key] = update
+                    while (true) {
+                        val next = updates.tryReceive().getOrNull() ?: break
+                        pendingUpdates[next.key] = next
+                    }
+                    try {
+                        var upstreamChanged = false
+                        var clientPolicyChanged = false
+                        pendingUpdates.forEachValue { pending ->
+                            withContext(NonCancellable) {
+                                when (pending) {
+                                    is RoutingUpdate.UpstreamSnapshot -> {
+                                        upstreamChanged = pending.upstream.update(pending.value) || upstreamChanged
+                                    }
+                                    is RoutingUpdate.NeighboursSnapshot -> {
+                                        neighbours = pending.neighbours
+                                        clientPolicyChanged = true
+                                    }
+                                    is RoutingUpdate.BlockedMacsSnapshot -> if (blockedMacs != pending.macs) {
+                                        blockedMacs = pending.macs
+                                        clientPolicyChanged = true
+                                    }
+                                }
+                            }
+                        }
+                        var clientSnapshot: ScatterMap<Inet4Address, MacAddress> = clients
+                        var allowedMacSnapshot: ScatterSet<MacAddress> = allowedMacs
+                        var nextClients: ScatterMap<Inet4Address, MacAddress>? = null
+                        var nextAllowedMacs: ScatterSet<MacAddress>? = null
+                        var added = MutableObjectList<Inet4Address>(0)
+                        var removed = MutableObjectList<Inet4Address>(0)
+                        var addedMacs = MutableObjectList<MacAddress>(0)
+                        var removedMacs = MutableObjectList<MacAddress>(0)
+                        val clientsChanged = if (clientPolicyChanged) {
+                            val candidateClients = MutableScatterMap<Inet4Address, MacAddress>(neighbours.size)
+                            val candidateAllowedMacs = MutableScatterSet<MacAddress>()
+                            for (neighbour in neighbours) {
+                                val lladdr = neighbour.validClientMac ?: continue
+                                if (neighbour.dev != downstream || lladdr in blockedMacs) continue
+                                candidateAllowedMacs.add(lladdr)
+                                if (neighbour.ip is Inet4Address) candidateClients[neighbour.ip] = lladdr
+                            }
+                            if (candidateClients == clients && candidateAllowedMacs == allowedMacs) false else {
+                                removed = MutableObjectList(clients.size)
+                                clients.forEach { ip, mac -> if (candidateClients[ip] != mac) removed.add(ip) }
+                                removedMacs = MutableObjectList(allowedMacs.size)
+                                allowedMacs.forEach { mac -> if (mac !in candidateAllowedMacs) removedMacs.add(mac) }
+                                // record stats before removing rules to prevent stats losing
+                                if (removed.isNotEmpty() || removedMacs.isNotEmpty()) {
+                                    withContext(NonCancellable) {
+                                        TrafficRecorder.update(bypassThrottling = true)
+                                    }
+                                }
+                                added = MutableObjectList(candidateClients.size)
+                                candidateClients.forEach { ip, mac -> if (clients[ip] != mac) added.add(ip) }
+                                addedMacs = MutableObjectList(candidateAllowedMacs.size)
+                                candidateAllowedMacs.forEach { mac -> if (mac !in allowedMacs) addedMacs.add(mac) }
+                                clientSnapshot = candidateClients
+                                allowedMacSnapshot = candidateAllowedMacs
+                                nextClients = candidateClients
+                                nextAllowedMacs = candidateAllowedMacs
+                                true
+                            }
+                        } else false
+                        if (upstreamChanged || clientsChanged) try {
+                            withContext(NonCancellable) {
+                                DaemonController.replaceSession(
+                                    session.id,
+                                    nextConfig(clientSnapshot, allowedMacSnapshot),
+                                )
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Timber.w(e)
+                            SmartSnackbar.make(e).show()
+                            continue
+                        }
+                        if (clientsChanged) {
+                            val committedClients = nextClients!!
+                            // Removed MACs become retired daemon counters only after the session replacement commits.
+                            if (removedMacs.isNotEmpty()) {
+                                withContext(NonCancellable) {
+                                    TrafficRecorder.update(bypassThrottling = true)
+                                }
+                            }
+                            withContext(NonCancellable) {
+                                removed.forEach { TrafficRecorder.unregister(it, downstream) }
+                                removedMacs.forEach { TrafficRecorder.unregister(it, downstream) }
+                            }
+                            addedMacs.forEach { TrafficRecorder.register(it, downstream) }
+                            added.forEach { ip ->
+                                try {
+                                    TrafficRecorder.register(ip, downstream, committedClients[ip]!!)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    Timber.w(e)
+                                    SmartSnackbar.make(e).show()
+                                }
+                            }
+                            clients.clear()
+                            clients.putAll(committedClients)
+                            allowedMacs.clear()
+                            allowedMacs.addAll(nextAllowedMacs!!)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Timber.w(e)
+                        SmartSnackbar.make(e).show()
+                    } finally {
+                        pendingUpdates.clear()
+                    }
+                }
+            } finally {
+                withContext(NonCancellable) {
+                    // record stats before exiting to prevent stats losing
+                    if (clients.isNotEmpty() || allowedMacs.isNotEmpty()) {
+                        TrafficRecorder.update(bypassThrottling = true)
+                    }
+                    session?.close()
+                    Timber.i("Stopped routing for $downstream by $caller")
+                }
             }
         }
-        FallbackUpstreamMonitor.registerCallback(fallbackUpstream)
-        UpstreamMonitor.registerCallback(upstream)
-        IpNeighbourMonitor.registerCallback(this, true)
-        if (VpnFirewallManager.mayBeAffected) VpnMonitor.registerCallback(emptyCallback)
+        return true
     }
+
+    private class UpstreamTracker {
+        private var interfaces = emptyList<String>()
+        var upstream: Upstream? = null
+            private set
+
+        fun update(value: Upstream?): Boolean {
+            if (upstream == value) return false
+            upstream = value
+            interfaces = value?.properties?.allInterfaceNames ?: emptyList()
+            return true
+        }
+
+        fun appendInterfaces(seen: MutableScatterSet<String>) = buildList(interfaces.size) {
+            interfaces.forEach { if (seen.add(it)) this += it }
+        }
+    }
+
+    private fun nextConfig(
+        clientSnapshot: ScatterMap<Inet4Address, MacAddress> = clients,
+        allowedMacSnapshot: ScatterSet<MacAddress> = allowedMacs,
+    ) = MutableScatterSet<String>().let { seen ->
+        SessionConfig(
+            downstream = downstream,
+            ip_forward = ipForward,
+            masquerade = masqueradeMode,
+            ipv6_block = ipv6Mode == Ipv6Mode.Block,
+            primary_network = primaryUpstream.upstream?.network?.networkHandle,
+            primary_routes = primaryUpstream.upstream?.properties?.allRoutes?.mapNotNull { route ->
+                val destination = route.destination
+                val address = destination.address
+                if (route.type == RouteInfo.RTN_UNICAST && address is Inet6Address) {
+                    Ipv6Prefix(address.address.toByteString(), destination.prefixLength)
+                } else null
+            } ?: emptyList(),
+            fallback_network = fallbackUpstream.upstream?.network?.networkHandle,
+            primary_upstream_interfaces = primaryUpstream.appendInterfaces(seen),
+            fallback_upstream_interfaces = fallbackUpstream.appendInterfaces(seen),
+            clients = buildList(allowedMacSnapshot.size) {
+                allowedMacSnapshot.forEach { mac ->
+                    add(ClientConfig(
+                        mac = mac.toByteArray().toByteString(),
+                        ipv4 = buildList(clientSnapshot.size) {
+                            clientSnapshot.forEach { ip, clientMac ->
+                                if (clientMac == mac) add(ip.address.toByteString())
+                            }
+                        },
+                    ))
+                }
+            },
+            ipv6_nat = if (ipv6Mode == Ipv6Mode.Nat) Ipv6NatConfig(ipv6NatPrefixSeed) else null,
+        )
+    }
+
+    suspend fun stopForClean() = withContext(NonCancellable) { job.cancelAndJoin() }
+
     suspend fun revert() = withContext(NonCancellable) {
-        transaction.revert()
-        stop()
-        TrafficRecorder.update()    // record stats before exiting to prevent stats losing
-        clients.values.forEach { it.close() }
+        job.cancelAndJoin()
+        clients.forEach { ip, _ -> TrafficRecorder.unregister(ip, downstream) }
+        allowedMacs.forEach { TrafficRecorder.unregister(it, downstream) }
         clients.clear()
-        fallbackUpstream.subrouting.values.forEach { it.revert() }
-        fallbackUpstream.subrouting.clear()
-        upstream.subrouting.values.forEach { it.revert() }
-        upstream.subrouting.clear()
+        allowedMacs.clear()
     }
 }

@@ -10,10 +10,10 @@ import androidx.recyclerview.widget.DiffUtil
 import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.R
 import be.mygod.vpnhotspot.net.InetAddressComparator
-import be.mygod.vpnhotspot.net.IpNeighbour
 import be.mygod.vpnhotspot.net.TetherType
 import be.mygod.vpnhotspot.room.AppDatabase
 import be.mygod.vpnhotspot.room.ClientRecord
+import be.mygod.vpnhotspot.root.daemon.NeighbourState
 import be.mygod.vpnhotspot.util.formatTimestamp
 import be.mygod.vpnhotspot.util.makeIpSpan
 import be.mygod.vpnhotspot.util.makeMacSpan
@@ -21,7 +21,7 @@ import java.net.InetAddress
 import java.util.Objects
 import java.util.TreeMap
 
-class Client(val mac: MacAddress, val iface: String? = null, val type: TetherType = TetherType.ofInterface(iface)) {
+class Client(val mac: MacAddress, iface: String? = null, val type: TetherType = TetherType.ofInterface(iface)) {
     companion object DiffCallback : DiffUtil.ItemCallback<Client>() {
         override fun areItemsTheSame(oldItem: Client, newItem: Client) =
                 oldItem.iface == newItem.iface && oldItem.type == newItem.type && oldItem.mac == newItem.mac
@@ -29,6 +29,8 @@ class Client(val mac: MacAddress, val iface: String? = null, val type: TetherTyp
     }
 
     val ip = TreeMap<InetAddress, ClientAddressInfo>(InetAddressComparator)
+    val ifaces = LinkedHashSet<String>().also { iface?.let(it::add) }
+    val iface get() = ifaces.firstOrNull()
     val macString by lazy { mac.toString() }
     private val record = AppDatabase.instance.clientRecordDao.lookupOrDefaultSync(mac)
     private val macIface get() = SpannableStringBuilder(makeMacSpan(macString)).apply {
@@ -58,15 +60,23 @@ class Client(val mac: MacAddress, val iface: String? = null, val type: TetherTyp
     val description = record.map { record ->
         SpannableStringBuilder().apply {
             if (record.nickname.isNotEmpty()) appendLine(macIface)
+            ifaces.forEach {
+                if (it == iface) return@forEach
+                append(makeMacSpan(macString))
+                append('%')
+                append(it)
+                appendLine()
+            }
             ip.entries.forEach { (ip, info) ->
                 append(makeIpSpan(ip))
                 info.address?.let { append("/${it.prefixLength}") }
                 append(when (info.state) {
-                    IpNeighbour.State.UNSET -> ""
-                    IpNeighbour.State.INCOMPLETE -> app.getText(R.string.connected_state_incomplete)
-                    IpNeighbour.State.VALID -> app.getText(R.string.connected_state_valid)
-                    IpNeighbour.State.FAILED -> app.getText(R.string.connected_state_failed)
-                    else -> error("Invalid IpNeighbour.State: ${info.state}")
+                    NeighbourState.NEIGHBOUR_STATE_UNSET -> ""
+                    NeighbourState.NEIGHBOUR_STATE_INCOMPLETE ->
+                        app.getText(R.string.connected_state_incomplete)
+                    NeighbourState.NEIGHBOUR_STATE_VALID -> app.getText(R.string.connected_state_valid)
+                    NeighbourState.NEIGHBOUR_STATE_FAILED -> app.getText(R.string.connected_state_failed)
+                    is NeighbourState.Unrecognized -> error("Invalid neighbour state ${info.state.value}")
                 })
                 if (info.address != null) {
                     info.hostname?.let { append(" →“$it”") }
@@ -76,6 +86,10 @@ class Client(val mac: MacAddress, val iface: String? = null, val type: TetherTyp
                 appendLine()
             }
         }.trimEnd()
+    }
+
+    fun addSource(iface: String?) {
+        ifaces.add(iface ?: return)
     }
 
     fun obtainRecord() = record.value ?: ClientRecord(mac)
@@ -88,8 +102,9 @@ class Client(val mac: MacAddress, val iface: String? = null, val type: TetherTyp
         if (mac != other.mac) return false
         if (type != other.type) return false
         if (ip != other.ip) return false
+        if (ifaces != other.ifaces) return false
 
         return true
     }
-    override fun hashCode() = Objects.hash(iface, mac, type, ip)
+    override fun hashCode() = Objects.hash(mac, type, ip, ifaces)
 }

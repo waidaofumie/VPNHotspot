@@ -25,8 +25,6 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.widget.Toolbar
 import androidx.core.os.persistableBundleOf
 import androidx.core.view.isGone
-import be.mygod.librootkotlinx.toByteArray
-import be.mygod.librootkotlinx.toParcelable
 import be.mygod.vpnhotspot.AlertDialogFragment
 import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.R
@@ -38,6 +36,8 @@ import be.mygod.vpnhotspot.util.RangeInput
 import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.util.readableMessage
 import be.mygod.vpnhotspot.util.showAllowingStateLoss
+import be.mygod.vpnhotspot.util.toByteArray
+import be.mygod.vpnhotspot.util.toParcelable
 import com.google.android.material.textfield.TextInputLayout
 import kotlinx.parcelize.Parcelize
 import timber.log.Timber
@@ -198,6 +198,7 @@ class WifiApDialogFragment : AlertDialogFragment<WifiApDialogFragment.Arg, WifiA
                 MacAddress.fromString(dialogView.persistentRandomizedMac.text.toString())
             } else null
             allowedAcsChannels = acsList.associate { (band, text, _) -> band to RangeInput.fromString(text.text) }
+            isBandOptimizationEnabled = dialogView.bandOptimization.isChecked
             if (arg.p2pMode || Build.VERSION.SDK_INT < 33) return@apply
             maxChannelBandwidth = (dialogView.maxChannelBandwidth.selectedItem as BandWidth).width
             if (Build.VERSION.SDK_INT >= 36) isClientIsolationEnabled = dialogView.clientIsolation.isChecked
@@ -233,9 +234,7 @@ class WifiApDialogFragment : AlertDialogFragment<WifiApDialogFragment.Arg, WifiA
                 hexSsid = !hexSsid
                 dialogView.ssid.setText(newText)
             }
-            findViewById<View>(com.google.android.material.R.id.text_input_end_icon).apply {
-                tooltipText = contentDescription
-            }
+            setEndIconContentDescription(R.string.wifi_ssid_toggle_hex)
         }
         dialogView.ssid.addTextChangedListener(this@WifiApDialogFragment)
         if (!arg.p2pMode) dialogView.security.apply {
@@ -313,7 +312,7 @@ class WifiApDialogFragment : AlertDialogFragment<WifiApDialogFragment.Arg, WifiA
         }
         dialogView.bssid.addTextChangedListener(this@WifiApDialogFragment)
         if (arg.p2pMode) dialogView.hiddenSsid.isGone = true
-        if (arg.p2pMode && Build.VERSION.SDK_INT >= 29) dialogView.macRandomization.isEnabled = false
+        if (arg.p2pMode) dialogView.macRandomization.isEnabled = false
         else if (arg.p2pMode || Build.VERSION.SDK_INT < 31) dialogView.macRandomizationWrapper.isGone = true
         else dialogView.macRandomization.onItemSelectedListener = this@WifiApDialogFragment
         if (arg.p2pMode || Build.VERSION.SDK_INT < 31) {
@@ -324,6 +323,9 @@ class WifiApDialogFragment : AlertDialogFragment<WifiApDialogFragment.Arg, WifiA
         } else {
             dialogView.bridgedTimeoutWrapper.helperText = getString(R.string.wifi_hotspot_timeout_default,
                 TetherTimeoutMonitor.defaultTimeoutBridged)
+        }
+        if (arg.p2pMode || Build.VERSION.SDK_INT < 30 || !SoftApConfigurationCompat.isBandOptimizationSupported) {
+            dialogView.bandOptimization.isGone = true
         }
         if (Build.VERSION.SDK_INT < 33) dialogView.vendorElementsWrapper.isGone = true
         else dialogView.vendorElements.addTextChangedListener(this@WifiApDialogFragment)
@@ -378,6 +380,9 @@ class WifiApDialogFragment : AlertDialogFragment<WifiApDialogFragment.Arg, WifiA
         dialogView.bandPrimary.setSelection(locate(0))
         if (Build.VERSION.SDK_INT >= 31 && !arg.p2pMode) {
             dialogView.bandSecondary.setSelection(if (base.channels.size() > 1) locate(1) + 1 else 0)
+        }
+        if (!arg.p2pMode && Build.VERSION.SDK_INT >= 30 && SoftApConfigurationCompat.isBandOptimizationSupported) {
+            dialogView.bandOptimization.isChecked = base.isBandOptimizationEnabled ?: true
         }
         dialogView.bssid.setText(base.bssid?.toString())
         dialogView.hiddenSsid.isChecked = base.isHiddenSsid

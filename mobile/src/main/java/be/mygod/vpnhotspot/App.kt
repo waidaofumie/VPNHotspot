@@ -22,10 +22,9 @@ import androidx.browser.customtabs.CustomTabColorSchemeParams
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.content.getSystemService
 import androidx.preference.PreferenceManager
-import be.mygod.librootkotlinx.NoShellException
-import be.mygod.vpnhotspot.net.DhcpWorkaround
 import be.mygod.vpnhotspot.room.AppDatabase
 import be.mygod.vpnhotspot.root.RootManager
+import be.mygod.vpnhotspot.util.CrashlyticsKeyProvider
 import be.mygod.vpnhotspot.util.DeviceStorageApp
 import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.util.privateLookup
@@ -36,6 +35,7 @@ import com.google.firebase.analytics.ParametersBuilder
 import com.google.firebase.analytics.logEvent
 import com.google.firebase.crashlytics.FirebaseCrashlytics
 import com.google.firebase.provider.FirebaseInitProvider
+import com.topjohnwu.superuser.NoShellException
 import kotlinx.coroutines.DEBUG_PROPERTY_NAME
 import kotlinx.coroutines.DEBUG_PROPERTY_VALUE_ON
 import kotlinx.coroutines.GlobalScope
@@ -58,7 +58,6 @@ class App : Application() {
         // alternative to PreferenceManager.getDefaultSharedPreferencesName(this)
         deviceStorage.moveSharedPreferencesFrom(this, PreferenceManager(this).sharedPreferencesName)
         deviceStorage.moveDatabaseFrom(this, AppDatabase.DB_NAME)
-        BootReceiver.migrateIfNecessary()
         Services.init { this }
 
         // overhead of debug mode is minimal: https://github.com/Kotlin/kotlinx.coroutines/blob/f528898/docs/debugging.md#debug-mode
@@ -96,18 +95,16 @@ class App : Application() {
                     if (priority != Log.DEBUG || BuildConfig.DEBUG) Log.println(priority, tag, message)
                     FirebaseCrashlytics.getInstance().log("${"XXVDIWEF".getOrElse(priority) { 'X' }}/$tag: $message")
                 } else {
-                    if (priority >= Log.WARN || priority == Log.DEBUG) {
-                        Log.println(priority, tag, message)
-                        Log.w(tag, message, t)
-                    }
+                    if (priority >= Log.WARN || priority == Log.DEBUG) Log.println(priority, tag, message)
                     if (priority >= Log.INFO && t !is NoShellException) {
-                        FirebaseCrashlytics.getInstance().recordException(t)
+                        val crashlyticsKeys = (t as? CrashlyticsKeyProvider)?.crashlyticsKeys
+                        if (crashlyticsKeys == null) FirebaseCrashlytics.getInstance().recordException(t)
+                        else FirebaseCrashlytics.getInstance().recordException(t, crashlyticsKeys)
                     }
                 }
             }
         })
         ServiceNotification.updateNotificationChannels()
-        if (DhcpWorkaround.shouldEnable) DhcpWorkaround.enable(true)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {

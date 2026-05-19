@@ -18,12 +18,14 @@ import be.mygod.vpnhotspot.net.TetherType
 import be.mygod.vpnhotspot.net.TetheringManagerCompat
 import be.mygod.vpnhotspot.util.readableMessage
 import be.mygod.vpnhotspot.util.stopAndUnbind
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
-sealed class TetheringTileService : IpNeighbourMonitoringTileService(), TetheringManagerCompat.StartTetheringCallback,
+sealed class TetheringTileService : NetlinkNeighbourMonitoringTileService(), TetheringManagerCompat.StartTetheringCallback,
     TetheringManagerCompat.StopTetheringCallback, TetherStates.Callback {
     protected val tileOff by lazy { Icon.createWithResource(application, icon) }
     protected val tileOn by lazy { Icon.createWithResource(application, R.drawable.ic_quick_settings_tile_on) }
@@ -34,6 +36,8 @@ sealed class TetheringTileService : IpNeighbourMonitoringTileService(), Tetherin
     private var tethered: List<String>? = null
     protected val interested get() = tethered?.filter { TetherType.ofInterface(it).isA(tetherType) }
     protected var binder: TetheringService.Binder? = null
+    private var listeningJob: Job? = null
+    private var serviceJob: Job? = null
     override fun onTetheredInterfacesChanged(interfaces: List<String?>) {
         tethered = interfaces.filterNotNull()
         updateTile()
@@ -50,11 +54,14 @@ sealed class TetheringTileService : IpNeighbourMonitoringTileService(), Tetherin
         super.onStartListening()
         bindService(Intent(this, TetheringService::class.java), this, BIND_AUTO_CREATE)
         TetherStates.registerCallback(this)
-        if (Build.VERSION.SDK_INT >= 30) TetherType.listener[this] = this::updateTile
+        if (Build.VERSION.SDK_INT >= 30) listeningJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            TetherType.changes.collect { updateTile() }
+        }
     }
 
     override fun onStopListening() {
-        if (Build.VERSION.SDK_INT >= 30) TetherType.listener -= this
+        listeningJob?.cancel()
+        listeningJob = null
         TetherStates.unregisterCallback(this)
         stopAndUnbind(this)
         super.onStopListening()
@@ -62,18 +69,21 @@ sealed class TetheringTileService : IpNeighbourMonitoringTileService(), Tetherin
 
     override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
         binder = service as TetheringService.Binder
-        service.routingsChanged[this] = this::updateTile
+        serviceJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            service.managedIfaces.collect { updateTile() }
+        }
         super.onServiceConnected(name, service)
     }
 
     override fun onServiceDisconnected(name: ComponentName?) {
-        binder?.routingsChanged?.remove(this)
+        serviceJob?.cancel()
+        serviceJob = null
         binder = null
     }
 
     override fun updateTile() {
         qsTile?.run {
-            subtitle(null)
+            subtitle = null
             val interested = interested
             when {
                 interested == null -> {
@@ -189,7 +199,7 @@ sealed class TetheringTileService : IpNeighbourMonitoringTileService(), Tetherin
 
         override fun updateTile() {
             qsTile?.run {
-                subtitle(null)
+                subtitle = null
                 val interested = interested
                 if (interested == null) {
                     state = Tile.STATE_UNAVAILABLE
@@ -208,7 +218,7 @@ sealed class TetheringTileService : IpNeighbourMonitoringTileService(), Tetherin
                     null -> {
                         state = Tile.STATE_INACTIVE
                         icon = tileOff
-                        subtitle(tethering?.activeFailureCause?.readableMessage)
+                        subtitle = tethering?.activeFailureCause?.readableMessage
                     }
                 }
                 label = getText(labelString)

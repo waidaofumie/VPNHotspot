@@ -5,6 +5,8 @@ import android.net.MacAddress
 import android.os.Build
 import android.os.Bundle
 import android.os.Parcelable
+import android.text.SpannableStringBuilder
+import android.text.TextUtils
 import android.text.format.Formatter
 import android.text.method.LinkMovementMethod
 import android.view.LayoutInflater
@@ -14,13 +16,17 @@ import android.view.ViewGroup
 import android.widget.EditText
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.widget.PopupMenu
-import androidx.collection.LongSparseArray
+import androidx.collection.LongObjectMap
+import androidx.collection.MutableScatterMap
+import androidx.collection.ObjectList
 import androidx.core.view.isVisible
 import androidx.databinding.BaseObservable
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.findViewTreeLifecycleOwner
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.withStarted
 import androidx.recyclerview.widget.DefaultItemAnimator
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -33,12 +39,11 @@ import be.mygod.vpnhotspot.R
 import be.mygod.vpnhotspot.databinding.FragmentClientsBinding
 import be.mygod.vpnhotspot.databinding.ListitemClientBinding
 import be.mygod.vpnhotspot.net.TetherType
-import be.mygod.vpnhotspot.net.monitor.IpNeighbourMonitor
 import be.mygod.vpnhotspot.net.monitor.TrafficRecorder
 import be.mygod.vpnhotspot.room.AppDatabase
 import be.mygod.vpnhotspot.room.ClientStats
 import be.mygod.vpnhotspot.room.TrafficRecord
-import be.mygod.vpnhotspot.util.format
+import be.mygod.vpnhotspot.room.TrafficStatsSource
 import be.mygod.vpnhotspot.util.formatTimestamp
 import be.mygod.vpnhotspot.util.showAllowingStateLoss
 import be.mygod.vpnhotspot.util.toPluralInt
@@ -91,17 +96,48 @@ class ClientsFragment : Fragment() {
             val context = context
             val resources = resources
             val locale = resources.configuration.locales[0]
-            setTitle(getText(R.string.clients_stats_title).format(locale, arg.title))
+            setTitle(TextUtils.expandTemplate(getText(R.string.clients_stats_title), arg.title))
             val format = NumberFormat.getIntegerInstance(locale)
-            setMessage("%s\n%s\n%s".format(
-                    resources.getQuantityString(R.plurals.clients_stats_message_1, arg.stats.count.toPluralInt(),
-                            format.format(arg.stats.count), context.formatTimestamp(arg.stats.timestamp)),
-                    resources.getQuantityString(R.plurals.clients_stats_message_2, arg.stats.sentPackets.toPluralInt(),
-                            format.format(arg.stats.sentPackets),
-                            Formatter.formatFileSize(context, arg.stats.sentBytes)),
-                    resources.getQuantityString(R.plurals.clients_stats_message_3, arg.stats.sentPackets.toPluralInt(),
-                            format.format(arg.stats.receivedPackets),
-                            Formatter.formatFileSize(context, arg.stats.receivedBytes))))
+            setMessage(SpannableStringBuilder().apply {
+                if (arg.stats.timestamp > 0) append(TextUtils.expandTemplate(getText(R.string.clients_stats_since),
+                    context.formatTimestamp(arg.stats.timestamp)))
+                for (stats in arg.stats.entries) if (!stats.isEmpty) {
+                    if (isNotEmpty()) append("\n\n")
+                    append(getText(when (stats.source) {
+                        TrafficStatsSource.IPV4 -> R.string.clients_stats_ipv4
+                        TrafficStatsSource.DNS -> R.string.clients_stats_dns
+                        TrafficStatsSource.NAT66_TCP -> R.string.clients_stats_nat66_tcp
+                        TrafficStatsSource.NAT66_UDP -> R.string.clients_stats_nat66_udp
+                        TrafficStatsSource.NAT66_ICMPV6 -> R.string.clients_stats_nat66_icmpv6
+                    }))
+                    when (stats.source) {
+                        TrafficStatsSource.NAT66_TCP -> {
+                            append(TextUtils.expandTemplate(resources.getQuantityText(R.plurals.clients_stats_connections,
+                                stats.sentPackets.toPluralInt()), format.format(stats.sentPackets)))
+                            append(TextUtils.expandTemplate(getText(R.string.clients_stats_sent_bytes),
+                                Formatter.formatFileSize(context, stats.sentBytes)))
+                            append(TextUtils.expandTemplate(getText(R.string.clients_stats_received_bytes),
+                                Formatter.formatFileSize(context, stats.receivedBytes)))
+                        }
+                        TrafficStatsSource.DNS -> {
+                            append(TextUtils.expandTemplate(resources.getQuantityText(R.plurals.clients_stats_dns_queries,
+                                stats.sentPackets.toPluralInt()), format.format(stats.sentPackets),
+                                Formatter.formatFileSize(context, stats.sentBytes)))
+                            append(TextUtils.expandTemplate(resources.getQuantityText(R.plurals.clients_stats_dns_responses,
+                                stats.receivedPackets.toPluralInt()), format.format(stats.receivedPackets),
+                                Formatter.formatFileSize(context, stats.receivedBytes)))
+                        }
+                        else -> {
+                            append(TextUtils.expandTemplate(resources.getQuantityText(R.plurals.clients_stats_message_2,
+                                stats.sentPackets.toPluralInt()), format.format(stats.sentPackets),
+                                Formatter.formatFileSize(context, stats.sentBytes)))
+                            append(TextUtils.expandTemplate(resources.getQuantityText(R.plurals.clients_stats_message_3,
+                                stats.receivedPackets.toPluralInt()), format.format(stats.receivedPackets),
+                                Formatter.formatFileSize(context, stats.receivedBytes)))
+                        }
+                    }
+                }
+            }.ifEmpty { getText(R.string.clients_stats_empty) })
             setPositiveButton(android.R.string.ok, null)
         }
     }
@@ -153,7 +189,6 @@ class ClientsFragment : Fragment() {
                             AppDatabase.instance.clientRecordDao.update(this@apply)
                         }
                     }
-                    IpNeighbourMonitor.instance?.flushAsync()
                     if (!wasWorking && item.itemId == R.id.block) {
                         SmartSnackbar.make(R.string.clients_popup_block_service_inactive).show()
                     }
@@ -182,34 +217,38 @@ class ClientsFragment : Fragment() {
     private inner class ClientAdapter : ListAdapter<Client, ClientViewHolder>(Client) {
         var size = CompletableDeferred(0)
 
-        override fun submitList(list: MutableList<Client>?) {
+        override fun submitList(list: List<Client>?) {
             binding.empty.isVisible = list.isNullOrEmpty()
             val deferred = CompletableDeferred<Int>()
             size = deferred
             super.submitList(list) { deferred.complete(list?.size ?: 0) }
-            binding.swipeRefresher.isRefreshing = false
         }
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) = ClientViewHolder(parent)
         override fun onBindViewHolder(holder: ClientViewHolder, position: Int) {
             val client = getItem(position)
             holder.binding.client = client
-            holder.binding.rate = rates.computeIfAbsent(client.iface to client.mac) { TrafficRate() }
+            holder.binding.rate = rates.compute(client.iface to client.mac) { _, rate -> rate ?: TrafficRate() }
             holder.binding.executePendingBindings()
         }
 
-        fun updateTraffic(newRecords: Collection<TrafficRecord>, oldRecords: LongSparseArray<TrafficRecord>) {
-            for (rate in rates.values) rate.clear()
-            for (newRecord in newRecords) {
-                val oldRecord = oldRecords[newRecord.previousId ?: continue] ?: continue
+        fun updateTraffic(newRecords: ObjectList<TrafficRecord>, oldRecords: LongObjectMap<TrafficRecord>) {
+            rates.forEachValue { it.clear() }
+            val rateKeys = MutableScatterMap<Pair<String, MacAddress>, Pair<String?, MacAddress>>()
+            currentList.forEach { client ->
+                client.ifaces.forEach { rateKeys[it to client.mac] = client.iface to client.mac }
+            }
+            newRecords.forEach { newRecord ->
+                val oldRecord = oldRecords[newRecord.previousId ?: return@forEach] ?: return@forEach
                 val elapsed = newRecord.timestamp - oldRecord.timestamp
                 if (elapsed == 0L) {
                     if (newRecord.sentPackets != oldRecord.sentPackets || newRecord.sentBytes != oldRecord.sentBytes ||
                         newRecord.receivedPackets != oldRecord.receivedPackets ||
                         newRecord.receivedBytes != oldRecord.receivedBytes) Timber.w(Exception("wtf"))
-                    continue
+                    return@forEach
                 }
-                val rate = rates.computeIfAbsent(newRecord.downstream to newRecord.mac) { TrafficRate() }
+                val key = rateKeys[newRecord.downstream to newRecord.mac] ?: (newRecord.downstream to newRecord.mac)
+                val rate = rates.compute(key) { _, rate -> rate ?: TrafficRate() }
                 if (rate.send < 0 || rate.receive < 0) {
                     rate.send = 0
                     rate.receive = 0
@@ -217,53 +256,42 @@ class ClientsFragment : Fragment() {
                 rate.send += (newRecord.sentBytes - oldRecord.sentBytes) * 1000 / elapsed
                 rate.receive += (newRecord.receivedBytes - oldRecord.receivedBytes) * 1000 / elapsed
             }
-            for (rate in rates.values) rate.notifyChange()
+            rates.forEachValue { it.notifyChange() }
         }
     }
 
     private lateinit var binding: FragmentClientsBinding
     private val adapter = ClientAdapter()
-    private var rates = mutableMapOf<Pair<String?, MacAddress>, TrafficRate>()
+    private var rates = MutableScatterMap<Pair<String?, MacAddress>, TrafficRate>()
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         binding = FragmentClientsBinding.inflate(inflater, container, false)
         binding.clients.layoutManager = LinearLayoutManager(context, RecyclerView.VERTICAL, false)
         binding.clients.itemAnimator = DefaultItemAnimator()
         binding.clients.adapter = adapter
-        binding.swipeRefresher.setColorSchemeResources(R.color.colorSecondary)
-        binding.swipeRefresher.setOnRefreshListener { IpNeighbourMonitor.instance?.flushAsync() }
         activityViewModels<ClientViewModel>().value.apply {
-            lifecycle.addObserver(fullMode)
-            clients.observe(viewLifecycleOwner) { adapter.submitList(it.toMutableList()) }
+            lifecycle.addObserver(clientsFragmentObserver)
+            clients.observe(viewLifecycleOwner) { adapter.submitList(it) }
+        }
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                // icon might be changed due to TetherType changes
+                if (Build.VERSION.SDK_INT >= 30) launch {
+                    TetherType.changes.collect {
+                        val size = adapter.size.await()
+                        adapter.notifyItemRangeChanged(0, size)
+                    }
+                }
+                launch {
+                    TrafficRecorder.foregroundUpdates.collect { (newRecords, oldRecords) ->
+                        adapter.updateTraffic(newRecords, oldRecords)
+                    }
+                }
+                withContext(Dispatchers.Default) {
+                    TrafficRecorder.rescheduleUpdate()  // next schedule time might be 1 min, force reschedule to <= 1s
+                }
+            }
         }
         return binding.root
-    }
-
-    override fun onStart() {
-        // icon might be changed due to TetherType changes
-        if (Build.VERSION.SDK_INT >= 30) TetherType.listener[this] = {
-            lifecycleScope.launch {
-                val size = adapter.size.await()
-                withStarted { adapter.notifyItemRangeChanged(0, size) }
-            }
-        }
-        super.onStart()
-        // we just put these two thing together as this is the only place we need to use this event for now
-        TrafficRecorder.foregroundListeners[this] = { newRecords, oldRecords ->
-            lifecycleScope.launch {
-                withStarted { adapter.updateTraffic(newRecords, oldRecords) }
-            }
-        }
-        lifecycleScope.launch {
-            withContext(Dispatchers.Default) {
-                TrafficRecorder.rescheduleUpdate()  // next schedule time might be 1 min, force reschedule to <= 1s
-            }
-        }
-    }
-
-    override fun onStop() {
-        TrafficRecorder.foregroundListeners -= this
-        super.onStop()
-        if (Build.VERSION.SDK_INT >= 30) TetherType.listener -= this
     }
 }
